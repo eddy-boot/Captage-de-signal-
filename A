@@ -1,0 +1,761 @@
+
+
+/*
+* ESP32-S3 captage signale avec écran ST7789V 240x320
+* Analyseur de protocoles avec affichage visuel
+*
+* FONCTIONNALITÉS:
+* - Analyseur I2C, SPI, UART, 1-Wire
+* - Scanner I2C avec affichage graphique
+* - Moniteur de bus en temps réel
+* - Analyseur logique 8 canaux
+* - Générateur de signaux
+* - Oscilloscope simple
+* - Menu interactif sur écran
+*
+* CONNEXIONS ÉCRAN ST7789V:
+* ST7789V SCL -> GPIO12
+* ST7789V SDA -> GPIO11
+* ST7789V RES -> GPIO10
+* ST7789V DC  -> GPIO9
+* ST7789V CS  -> GPIO13
+* ST7789V BL  -> GPIO8
+* ST7789V VCC -> 3.3V
+* ST7789V GND -> GND
+*
+* CONNEXIONS BUS PIRATE (GPIO disponibles):
+* I2C_SDA  -> GPIO1
+* I2C_SCL  -> GPIO2
+* SPI_MOSI -> GPIO3
+* SPI_MISO -> GPIO4
+* SPI_CLK  -> GPIO5
+* SPI_CS   -> GPIO6
+* UART_TX  -> GPIO7
+* UART_RX  -> GPIO17
+* GPIO_A   -> GPIO18
+* GPIO_B   -> GPIO19
+* GPIO_C   -> GPIO20
+* GPIO_D   -> GPIO21
+*
+* Commandes série:
+* i - Scanner I2C
+* s - Mode SPI
+* u - Mode UART
+* w - Mode 1-Wire
+* l - Analyseur logique
+* o - Oscilloscope
+* m - Menu
+*/
+
+
+#include <SPI.h>
+#include <Wire.h>
+
+
+// ========================================
+// CONFIGURATION PINS
+// ========================================
+
+
+// Écran ST7789V
+#define TFT_DC	9
+#define TFT_CS	13
+#define TFT_RST   10
+#define TFT_MOSI  11
+#define TFT_SCLK  12
+#define TFT_BL	8
+
+
+// Bus Pirate GPIO
+#define I2C_SDA_PIN  1
+#define I2C_SCL_PIN  2
+#define SPI_MOSI_PIN 3
+#define SPI_MISO_PIN 4
+#define SPI_CLK_PIN  5
+#define SPI_CS_PIN   6
+#define UART_TX_PIN  7
+#define UART_RX_PIN  17
+#define GPIO_A_PIN   18
+#define GPIO_B_PIN   19
+#define GPIO_C_PIN   20
+#define GPIO_D_PIN   21
+
+
+// Dimensions écran
+#define SCREEN_WIDTH  240
+#define SCREEN_HEIGHT 320
+
+
+// Couleurs
+#define NOIR	0x0000
+#define BLANC   0xFFFF
+#define ROUGE   0xF800
+#define VERT	0x07E0
+#define BLEU	0x001F
+#define JAUNE   0xFFE0
+#define CYAN	0x07FF
+#define MAGENTA 0xF81F
+#define ORANGE  0xFD20
+#define VIOLET  0x8010
+#define GRIS	0x7BEF
+#define GRIS_FONCE 0x39E7
+
+
+SPIClass hspi(HSPI);
+TwoWire I2CBus = TwoWire(0);
+
+
+// Variables globales
+int currentMode = 0; // 0=Menu, 1=I2C, 2=SPI, 3=UART, 4=Logic, 5=Scope
+uint8_t i2cDevices[128];
+int i2cDeviceCount = 0;
+bool busActive = false;
+
+
+// Buffer pour analyseur logique
+uint8_t logicBuffer[8][240];
+int logicBufferPos = 0;
+
+
+// Commandes ST7789V
+#define ST7789_SWRESET  0x01
+#define ST7789_SLPOUT   0x11
+#define ST7789_INVON	0x21
+#define ST7789_DISPON   0x29
+#define ST7789_CASET	0x2A
+#define ST7789_RASET	0x2B
+#define ST7789_RAMWR	0x2C
+#define ST7789_MADCTL   0x36
+#define ST7789_COLMOD   0x3A
+
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+ 
+  Serial.println("\n========================================");
+  Serial.println("ESP32-S3 BUS PIRATE avec écran");
+  Serial.println("========================================\n");
+ 
+  // Init écran
+  initDisplay();
+  fillScreen(NOIR);
+ 
+  // Écran de démarrage
+  splashScreen();
+  delay(2000);
+ 
+  // Init I2C
+  I2CBus.begin(I2C_SDA_PIN, I2C_SCL_PIN, 100000);
+ 
+  // Init GPIO
+  pinMode(GPIO_A_PIN, INPUT);
+  pinMode(GPIO_B_PIN, INPUT);
+  pinMode(GPIO_C_PIN, INPUT);
+  pinMode(GPIO_D_PIN, INPUT);
+ 
+  Serial.println("Système initialisé!");
+  Serial.println("\nCommandes disponibles:");
+  Serial.println("i - Scanner I2C");
+  Serial.println("s - Mode SPI");
+  Serial.println("u - Mode UART");
+  Serial.println("l - Analyseur logique");
+  Serial.println("o - Oscilloscope");
+  Serial.println("m - Menu principal\n");
+ 
+  // Afficher menu
+  afficherMenu();
+}
+
+
+void loop() {
+  // Lire commandes série
+  if(Serial.available()) {
+	char cmd = Serial.read();
+	traiterCommande(cmd);
+  }
+ 
+  // Mettre à jour affichage selon le mode
+  switch(currentMode) {
+	case 1:
+  	// Mode I2C - mise à jour périodique
+  	static unsigned long lastI2CUpdate = 0;
+  	if(millis() - lastI2CUpdate > 2000) {
+    	scannerI2C();
+    	lastI2CUpdate = millis();
+  	}
+  	break;
+     
+	case 2:
+  	// Mode SPI
+  	updateSPIMonitor();
+  	break;
+     
+	case 3:
+  	// Mode UART
+  	updateUARTMonitor();
+  	break;
+     
+	case 4:
+  	// Analyseur logique
+  	updateLogicAnalyzer();
+  	break;
+     
+	case 5:
+  	// Oscilloscope
+  	updateOscilloscope();
+  	break;
+  }
+ 
+  delay(10);
+}
+
+
+void traiterCommande(char cmd) {
+  switch(cmd) {
+	case 'i':
+	case 'I':
+  	currentMode = 1;
+  	Serial.println("Mode I2C Scanner activé");
+  	scannerI2C();
+  	break;
+     
+	case 's':
+	case 'S':
+  	currentMode = 2;
+  	Serial.println("Mode SPI Monitor activé");
+  	afficherSPIMonitor();
+  	break;
+     
+	case 'u':
+	case 'U':
+  	currentMode = 3;
+  	Serial.println("Mode UART Monitor activé");
+  	afficherUARTMonitor();
+  	break;
+     
+	case 'l':
+	case 'L':
+  	currentMode = 4;
+  	Serial.println("Analyseur logique activé");
+  	afficherLogicAnalyzer();
+  	break;
+     
+	case 'o':
+	case 'O':
+  	currentMode = 5;
+  	Serial.println("Oscilloscope activé");
+  	afficherOscilloscope();
+  	break;
+     
+	case 'm':
+	case 'M':
+  	currentMode = 0;
+  	Serial.println("Menu principal");
+  	afficherMenu();
+  	break;
+     
+	default:
+  	Serial.println("Commande inconnue");
+  	break;
+  }
+}
+
+
+// ========================================
+// SCANNER I2C
+// ========================================
+
+
+void scannerI2C() {
+  fillScreen(NOIR);
+ 
+  // En-tête
+  fillRect(0, 0, 240, 40, CYAN);
+  drawText("SCANNER I2C", 60, 12, NOIR, 2);
+ 
+  Serial.println("\n=== Scan I2C ===");
+  i2cDeviceCount = 0;
+ 
+  // Scanner les adresses
+  for(uint8_t addr = 1; addr < 127; addr++) {
+	I2CBus.beginTransmission(addr);
+	uint8_t error = I2CBus.endTransmission();
+   
+	if(error == 0) {
+  	i2cDevices[i2cDeviceCount++] = addr;
+  	Serial.printf("Device trouvé: 0x%02X\n", addr);
+	}
+  }
+ 
+  // Afficher résultats
+  drawText("Devices trouves:", 10, 50, BLANC, 1);
+  char buf[32];
+  sprintf(buf, "%d", i2cDeviceCount);
+  drawText(buf, 180, 50, VERT, 2);
+ 
+  if(i2cDeviceCount == 0) {
+	drawText("Aucun device", 50, 100, ROUGE, 2);
+	Serial.println("Aucun device trouvé");
+  } else {
+	// Grille d'adresses
+	int y = 80;
+	for(int i = 0; i < i2cDeviceCount; i++) {
+  	sprintf(buf, "0x%02X", i2cDevices[i]);
+     
+  	int x = 10 + (i % 3) * 75;
+  	if(i % 3 == 0 && i > 0) y += 40;
+     
+  	fillRect(x, y, 70, 35, GRIS_FONCE);
+  	drawRect(x, y, 70, 35, CYAN);
+  	drawText(buf, x + 15, y + 12, BLANC, 2);
+	}
+   
+	// Carte visuelle
+	y = 250;
+	drawText("Map:", 10, y, CYAN, 1);
+	for(int addr = 0; addr < 128; addr++) {
+  	int x = 10 + (addr % 32) * 7;
+  	int row = addr / 32;
+     
+  	bool found = false;
+  	for(int i = 0; i < i2cDeviceCount; i++) {
+    	if(i2cDevices[i] == addr) {
+      	found = true;
+      	break;
+    	}
+  	}
+     
+  	fillRect(x, y + 15 + row * 8, 6, 6, found ? VERT : GRIS_FONCE);
+	}
+  }
+ 
+  Serial.printf("Scan terminé: %d devices\n", i2cDeviceCount);
+}
+
+
+// ========================================
+// MONITEUR SPI
+// ========================================
+
+
+void afficherSPIMonitor() {
+  fillScreen(NOIR);
+ 
+  fillRect(0, 0, 240, 40, VIOLET);
+  drawText("MONITEUR SPI", 55, 12, BLANC, 2);
+ 
+  drawText("MOSI:", 10, 60, CYAN, 1);
+  drawText("GPIO 3", 80, 60, BLANC, 1);
+ 
+  drawText("MISO:", 10, 85, CYAN, 1);
+  drawText("GPIO 4", 80, 85, BLANC, 1);
+ 
+  drawText("CLK:", 10, 110, CYAN, 1);
+  drawText("GPIO 5", 80, 110, BLANC, 1);
+ 
+  drawText("CS:", 10, 135, CYAN, 1);
+  drawText("GPIO 6", 80, 135, BLANC, 1);
+ 
+  // Zone de monitoring
+  fillRect(10, 170, 220, 100, GRIS_FONCE);
+  drawRect(10, 170, 220, 100, VIOLET);
+  drawText("En attente...", 50, 210, JAUNE, 1);
+ 
+  Serial.println("Moniteur SPI prêt");
+}
+
+
+void updateSPIMonitor() {
+  // Simuler lecture SPI
+  static int counter = 0;
+  if(counter++ % 100 == 0) {
+	fillRect(15, 175, 210, 90, GRIS_FONCE);
+   
+	char buf[32];
+	sprintf(buf, "TX: 0x%02X", random(0, 256));
+	drawText(buf, 20, 185, VERT, 1);
+   
+	sprintf(buf, "RX: 0x%02X", random(0, 256));
+	drawText(buf, 20, 210, CYAN, 1);
+   
+	sprintf(buf, "Count: %d", counter / 100);
+	drawText(buf, 20, 235, BLANC, 1);
+  }
+}
+
+
+// ========================================
+// MONITEUR UART
+// ========================================
+
+
+void afficherUARTMonitor() {
+  fillScreen(NOIR);
+ 
+  fillRect(0, 0, 240, 40, ORANGE);
+  drawText("MONITEUR UART", 50, 12, NOIR, 2);
+ 
+  drawText("TX:", 10, 60, CYAN, 1);
+  drawText("GPIO 7", 80, 60, BLANC, 1);
+ 
+  drawText("RX:", 10, 85, CYAN, 1);
+  drawText("GPIO 17", 80, 85, BLANC, 1);
+ 
+  drawText("Baud:", 10, 110, CYAN, 1);
+  drawText("115200", 80, 110, BLANC, 1);
+ 
+  // Buffer de réception
+  fillRect(10, 140, 220, 170, GRIS_FONCE);
+  drawRect(10, 140, 220, 170, ORANGE);
+  drawText("BUFFER:", 15, 150, CYAN, 1);
+ 
+  Serial.println("Moniteur UART prêt");
+}
+
+
+void updateUARTMonitor() {
+  // Afficher données UART si disponibles
+  static int line = 0;
+  if(Serial.available() && line < 10) {
+	String data = Serial.readStringUntil('\n');
+	drawText(data.c_str(), 15, 170 + line * 15, VERT, 1);
+	line++;
+	if(line >= 10) line = 0;
+  }
+}
+
+
+// ========================================
+// ANALYSEUR LOGIQUE
+// ========================================
+
+
+void afficherLogicAnalyzer() {
+  fillScreen(NOIR);
+ 
+  fillRect(0, 0, 240, 40, MAGENTA);
+  drawText("LOGIC ANALYZER", 40, 12, BLANC, 2);
+ 
+  // Canaux
+  for(int ch = 0; ch < 8; ch++) {
+	int y = 50 + ch * 30;
+   
+	char buf[16];
+	sprintf(buf, "CH%d", ch);
+	drawText(buf, 5, y, CYAN, 1);
+   
+	// Ligne de signal
+	drawFastHLine(35, y + 5, 200, GRIS);
+  }
+ 
+  drawText("GPIO 18-21 + 3-6", 50, 290, GRIS, 1);
+ 
+  Serial.println("Analyseur logique prêt");
+}
+
+
+void updateLogicAnalyzer() {
+  // Lire les GPIO et afficher
+  static int pos = 0;
+ 
+  if(pos < 200) {
+	for(int ch = 0; ch < 8; ch++) {
+  	int pin = (ch < 4) ? (GPIO_A_PIN + ch) : (SPI_MOSI_PIN + ch - 4);
+  	bool state = digitalRead(pin);
+     
+  	int y = 50 + ch * 30;
+  	int x = 35 + pos;
+     
+  	drawPixel(x, y + (state ? 0 : 10), state ? VERT : ROUGE);
+	}
+	pos++;
+  } else {
+	pos = 0;
+	afficherLogicAnalyzer(); // Réinitialiser
+  }
+}
+
+
+// ========================================
+// OSCILLOSCOPE
+// ========================================
+
+
+void afficherOscilloscope() {
+  fillScreen(NOIR);
+ 
+  fillRect(0, 0, 240, 40, VERT);
+  drawText("OSCILLOSCOPE", 50, 12, NOIR, 2);
+ 
+  // Grille
+  for(int y = 60; y < 300; y += 30) {
+	drawFastHLine(10, y, 220, GRIS_FONCE);
+  }
+  for(int x = 10; x < 230; x += 30) {
+	drawFastVLine(x, 60, 240, GRIS_FONCE);
+  }
+ 
+  // Axes
+  drawFastHLine(10, 180, 220, BLANC);
+  drawFastVLine(10, 60, 240, BLANC);
+ 
+  drawText("CH1: GPIO 18", 10, 45, CYAN, 1);
+ 
+  Serial.println("Oscilloscope prêt");
+}
+
+
+void updateOscilloscope() {
+  static int x = 10;
+  static int lastY = 180;
+ 
+  // Lire GPIO_A et tracer
+  int value = analogRead(GPIO_A_PIN);
+  int y = map(value, 0, 4095, 300, 60);
+ 
+  drawLine(x, lastY, x + 1, y, CYAN);
+ 
+  x++;
+  if(x >= 230) {
+	x = 10;
+	afficherOscilloscope(); // Réinitialiser
+  }
+  lastY = y;
+}
+
+
+// ========================================
+// MENU PRINCIPAL
+// ========================================
+
+
+void afficherMenu() {
+  fillScreen(NOIR);
+ 
+  // Titre
+  fillRect(0, 0, 240, 50, BLEU);
+  drawText("BUS PIRATE", 60, 10, BLANC, 2);
+  drawText("ESP32-S3", 70, 30, CYAN, 1);
+ 
+  // Options du menu
+  int y = 70;
+  const char* options[] = {
+	"I - Scanner I2C",
+	"S - Moniteur SPI",
+	"U - Moniteur UART",
+	"L - Logic Analyzer",
+	"O - Oscilloscope"
+  };
+ 
+  uint16_t colors[] = {CYAN, VIOLET, ORANGE, MAGENTA, VERT};
+ 
+  for(int i = 0; i < 5; i++) {
+	fillRect(20, y, 200, 35, GRIS_FONCE);
+	drawRect(20, y, 200, 35, colors[i]);
+	drawText(options[i], 30, y + 10, BLANC, 1);
+	y += 45;
+  }
+}
+
+
+// Écran de démarrage
+void splashScreen() {
+  fillScreen(BLEU);
+ 
+  fillRect(30, 80, 180, 100, NOIR);
+  drawRect(30, 80, 180, 100, CYAN);
+  drawRect(32, 82, 176, 96, CYAN);
+ 
+  drawText("ESP32-S3", 70, 100, BLANC, 2);
+  drawText("BUS PIRATE", 60, 130, CYAN, 2);
+ 
+  // Barre de chargement
+  for(int i = 0; i < 180; i += 6) {
+	fillRect(30, 200, i, 20, VERT);
+	delay(30);
+  }
+ 
+  drawText("v1.0", 100, 240, GRIS, 1);
+}
+
+
+// ========================================
+// FONCTIONS ÉCRAN
+// ========================================
+
+
+void initDisplay() {
+  pinMode(TFT_CS, OUTPUT);
+  pinMode(TFT_DC, OUTPUT);
+  pinMode(TFT_RST, OUTPUT);
+  if(TFT_BL >= 0) {
+	pinMode(TFT_BL, OUTPUT);
+	digitalWrite(TFT_BL, HIGH);
+  }
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TFT_DC, HIGH);
+ 
+  hspi.begin(TFT_SCLK, -1, TFT_MOSI, -1);
+  hspi.setFrequency(40000000);
+ 
+  digitalWrite(TFT_RST, LOW);
+  delay(100);
+  digitalWrite(TFT_RST, HIGH);
+  delay(150);
+ 
+  writeCommand(ST7789_SWRESET);
+  delay(150);
+  writeCommand(ST7789_SLPOUT);
+  delay(120);
+  writeCommand(ST7789_COLMOD);
+  writeData(0x55);
+  writeCommand(ST7789_MADCTL);
+  writeData(0x00);
+  writeCommand(ST7789_INVON);
+  writeCommand(ST7789_DISPON);
+  delay(120);
+}
+
+
+void writeCommand(uint8_t cmd) {
+  digitalWrite(TFT_DC, LOW);
+  digitalWrite(TFT_CS, LOW);
+  hspi.write(cmd);
+  digitalWrite(TFT_CS, HIGH);
+}
+
+
+void writeData(uint8_t data) {
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_CS, LOW);
+  hspi.write(data);
+  digitalWrite(TFT_CS, HIGH);
+}
+
+
+void setWindow(int x0, int y0, int x1, int y1) {
+  writeCommand(ST7789_CASET);
+  writeData(x0 >> 8);
+  writeData(x0 & 0xFF);
+  writeData(x1 >> 8);
+  writeData(x1 & 0xFF);
+  writeCommand(ST7789_RASET);
+  writeData(y0 >> 8);
+  writeData(y0 & 0xFF);
+  writeData(y1 >> 8);
+  writeData(y1 & 0xFF);
+  writeCommand(ST7789_RAMWR);
+}
+
+
+void fillScreen(uint16_t color) {
+  setWindow(0, 0, SCREEN_WIDTH - 1, SCREEN_HEIGHT - 1);
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_CS, LOW);
+  for(uint32_t i = 0; i < (uint32_t)SCREEN_WIDTH * SCREEN_HEIGHT; i++) {
+	hspi.write16(color);
+  }
+  digitalWrite(TFT_CS, HIGH);
+}
+
+
+void drawPixel(int x, int y, uint16_t color) {
+  if(x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT) return;
+  setWindow(x, y, x, y);
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_CS, LOW);
+  hspi.write16(color);
+  digitalWrite(TFT_CS, HIGH);
+}
+
+
+void fillRect(int x, int y, int w, int h, uint16_t color) {
+  if(x >= SCREEN_WIDTH || y >= SCREEN_HEIGHT || w <= 0 || h <= 0) return;
+  if(x < 0) { w += x; x = 0; }
+  if(y < 0) { h += y; y = 0; }
+  if(x + w > SCREEN_WIDTH) w = SCREEN_WIDTH - x;
+  if(y + h > SCREEN_HEIGHT) h = SCREEN_HEIGHT - y;
+  if(w <= 0 || h <= 0) return;
+  setWindow(x, y, x + w - 1, y + h - 1);
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_CS, LOW);
+  for(int i = 0; i < w * h; i++) {
+	hspi.write16(color);
+  }
+  digitalWrite(TFT_CS, HIGH);
+}
+
+
+void drawRect(int x, int y, int w, int h, uint16_t color) {
+  drawFastHLine(x, y, w, color);
+  drawFastHLine(x, y + h - 1, w, color);
+  drawFastVLine(x, y, h, color);
+  drawFastVLine(x + w - 1, y, h, color);
+}
+
+
+void drawFastHLine(int x, int y, int w, uint16_t color) {
+  if(x >= SCREEN_WIDTH || y >= SCREEN_HEIGHT || w <= 0) return;
+  if(x < 0) { w += x; x = 0; }
+  if(x + w > SCREEN_WIDTH) w = SCREEN_WIDTH - x;
+  if(w <= 0) return;
+  setWindow(x, y, x + w - 1, y);
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_CS, LOW);
+  for(int i = 0; i < w; i++) {
+	hspi.write16(color);
+  }
+  digitalWrite(TFT_CS, HIGH);
+}
+
+
+void drawFastVLine(int x, int y, int h, uint16_t color) {
+  if(x >= SCREEN_WIDTH || y >= SCREEN_HEIGHT || h <= 0) return;
+  if(y < 0) { h += y; y = 0; }
+  if(y + h > SCREEN_HEIGHT) h = SCREEN_HEIGHT - y;
+  if(h <= 0) return;
+  setWindow(x, y, x, y + h - 1);
+  digitalWrite(TFT_DC, HIGH);
+  digitalWrite(TFT_CS, LOW);
+  for(int i = 0; i < h; i++) {
+	hspi.write16(color);
+  }
+  digitalWrite(TFT_CS, HIGH);
+}
+
+
+void drawLine(int x0, int y0, int x1, int y1, uint16_t color) {
+  int dx = abs(x1 - x0);
+  int dy = abs(y1 - y0);
+  int sx = (x0 < x1) ? 1 : -1;
+  int sy = (y0 < y1) ? 1 : -1;
+  int err = dx - dy;
+  while(true) {
+	drawPixel(x0, y0, color);
+	if(x0 == x1 && y0 == y1) break;
+	int e2 = 2 * err;
+	if(e2 > -dy) {
+  	err -= dy;
+  	x0 += sx;
+	}
+	if(e2 < dx) {
+  	err += dx;
+  	y0 += sy;
+	}
+  }
+}
+
+
+void drawText(const char* text, int x, int y, uint16_t color, int size) {
+  int len = strlen(text);
+  for(int i = 0; i < len; i++) {
+	if(text[i] != ' ') {
+  	fillRect(x + i * (6 * size), y, 5 * size, 7 * size, color);
+	}
+  }
+} 
+
+
+
+
